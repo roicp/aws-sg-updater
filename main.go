@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -9,6 +10,9 @@ import (
 	"net/http"
 	"os"
 	"strings"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
 )
 
 const (
@@ -41,6 +45,23 @@ func getPublicIP() (string, error) {
 	return ip, nil
 }
 
+func loadAWSConfig(ctx context.Context, profileName string) (aws.Config, error) {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profileName))
+	if err != nil {
+		return aws.Config{}, fmt.Errorf("failed to load AWS configuration for profile '%s': %w", profileName, err)
+	}
+
+	log.Printf("Loaded AWS configuration using profile: %s\n", profileName)
+
+	if cfg.Region == "" {
+		log.Println("Warning: AWS Region not specified in profile or environment variables. SDK might default to one (e.g., us-east-1) or fail if region is required.")
+	} else {
+		log.Printf("Using AWS Region: %s\n", cfg.Region)
+	}
+
+	return cfg, nil
+}
+
 func main() {
 	myName := flag.String("my-name", "", "Name of the host to resolve")
 	profileName := flag.String("profile", "default", "AWS profile name from credentials")
@@ -69,10 +90,17 @@ func main() {
 		log.Fatalf("Error getting public IP: %v", err)
 	}
 
+	ctx := context.TODO()
+	awsCfg, err := loadAWSConfig(ctx, *profileName)
+	if err != nil {
+		log.Fatalf("Error loading AWS config: %v", err)
+	}
+
 	fmt.Println("-----------------------------------------")
 	// fmt.Printf("✅ Successfully updated Security Group %s\n", finalSgID)
 	fmt.Printf("   Allowed TCP traffic from: %s/32\n", publicIP)
 	fmt.Printf("   Rule description: %s\n", *myName)
 	fmt.Printf("   Using AWS Profile: %s\n", *profileName)
+	fmt.Printf("   Using AWS Region: %s\n", awsCfg.Region)
 	fmt.Println("-----------------------------------------")
 }
