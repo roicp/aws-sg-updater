@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -13,6 +14,9 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
 )
 
 const (
@@ -62,6 +66,67 @@ func loadAWSConfig(ctx context.Context, profileName string) (aws.Config, error) 
 	return cfg, nil
 }
 
+func findSecurityGroupID(ctx context.Context, client *ec2.Client, sgID string, sgTagName string) (string, error) {
+	if sgID != "" {
+		log.Printf("Verifying provided Security Group ID: %s\n", sgID)
+
+		input := &ec2.DescribeSecurityGroupsInput{
+			GroupIds: []string{sgID},
+		}
+
+		_, err := client.DescribeSecurityGroups(ctx, input)
+
+		if err != nil {
+			var apiErr *smithy.GenericAPIError
+
+			if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidGroup.NotFound" {
+				return "", fmt.Errorf("security group with ID '%s' not found", sgID)
+			}
+
+			return "", fmt.Errorf("failed to verify security group ID '%s': %w", sgID, err)
+		}
+
+		log.Printf("Security Group ID %s verified successfully.\n", sgID)
+
+		return sgID, nil
+	}
+
+	if sgTagName != "" {
+		log.Printf("Searching for Security Group with tag Name: %s\n", sgTagName)
+
+		input := &ec2.DescribeSecurityGroupsInput{
+			Filters: []types.Filter{
+				{
+					Name:   aws.String("tag:Name"),
+					Values: []string{sgTagName},
+				},
+			},
+		}
+
+		result, err := client.DescribeSecurityGroups(ctx, input)
+
+		if err != nil {
+			return "", fmt.Errorf("failed to describe security groups with tag Name '%s': %w", sgTagName, err)
+		}
+
+		if len(result.SecurityGroups) == 0 {
+			return "", fmt.Errorf("no security group found with tag Name: %s", sgTagName)
+		}
+
+		if len(result.SecurityGroups) > 1 {
+			return "", fmt.Errorf("multiple security groups found with tag Name: %s. Please use --sg-id for specificity", sgTagName)
+		}
+
+		foundID := *result.SecurityGroups[0].GroupId
+
+		log.Printf("Found Security Group ID by tag: %s\n", foundID)
+
+		return foundID, nil
+	}
+
+	return "", fmt.Errorf("you must specify either --sg-id or --sg-tag-name")
+}
+
 func main() {
 	myName := flag.String("my-name", "", "Name of the host to resolve")
 	profileName := flag.String("profile", "default", "AWS profile name from credentials")
@@ -77,9 +142,9 @@ func main() {
 	}
 
 	targetSgId := *sgId
-	targetSgName := *sgTagName
+	targetSgTagName := *sgTagName
 
-	if targetSgId == "" && targetSgName == "" {
+	if targetSgId == "" && targetSgTagName == "" {
 		fmt.Println("Neither --sg-id nor --sg-tag-name provided")
 		flag.Usage()
 		os.Exit(1)
@@ -96,11 +161,18 @@ func main() {
 		log.Fatalf("Error loading AWS config: %v", err)
 	}
 
-	fmt.Println("-----------------------------------------")
-	// fmt.Printf("✅ Successfully updated Security Group %s\n", finalSgID)
+	ec2Client := ec2.NewFromConfig(awsCfg)
+
+	finalSgID, err := findSecurityGroupID(ctx, ec2Client, targetSgId, targetSgTagName)
+	if err != nil {
+		log.Fatalf("Error finding Security Group: %v", err)
+	}
+
+	fmt.Println("---------------------------------------------------------------")
+	fmt.Printf("✅ Successfully updated Security Group %s\n", finalSgID)
 	fmt.Printf("   Allowed TCP traffic from: %s/32\n", publicIP)
 	fmt.Printf("   Rule description: %s\n", *myName)
 	fmt.Printf("   Using AWS Profile: %s\n", *profileName)
 	fmt.Printf("   Using AWS Region: %s\n", awsCfg.Region)
-	fmt.Println("-----------------------------------------")
+	fmt.Println("---------------------------------------------------------------")
 }
