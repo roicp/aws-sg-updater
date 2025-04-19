@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
 )
 
 const (
@@ -66,7 +68,26 @@ func loadAWSConfig(ctx context.Context, profileName string) (aws.Config, error) 
 
 func findSecurityGroupID(ctx context.Context, client *ec2.Client, sgID string, sgTagName string) (string, error) {
 	if sgID != "" {
-		log.Printf("Using provided Security Group ID: %s\n", sgID)
+		log.Printf("Verifying provided Security Group ID: %s\n", sgID)
+
+		input := &ec2.DescribeSecurityGroupsInput{
+			GroupIds: []string{sgID},
+		}
+
+		_, err := client.DescribeSecurityGroups(ctx, input)
+
+		if err != nil {
+			var apiErr *smithy.GenericAPIError
+
+			if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidGroup.NotFound" {
+				return "", fmt.Errorf("security group with ID '%s' not found", sgID)
+			}
+
+			return "", fmt.Errorf("failed to verify security group ID '%s': %w", sgID, err)
+		}
+
+		log.Printf("Security Group ID %s verified successfully.\n", sgID)
+
 		return sgID, nil
 	}
 
@@ -147,11 +168,11 @@ func main() {
 		log.Fatalf("Error finding Security Group: %v", err)
 	}
 
-	fmt.Println("-----------------------------------------")
+	fmt.Println("---------------------------------------------------------------")
 	fmt.Printf("✅ Successfully updated Security Group %s\n", finalSgID)
 	fmt.Printf("   Allowed TCP traffic from: %s/32\n", publicIP)
 	fmt.Printf("   Rule description: %s\n", *myName)
 	fmt.Printf("   Using AWS Profile: %s\n", *profileName)
 	fmt.Printf("   Using AWS Region: %s\n", awsCfg.Region)
-	fmt.Println("-----------------------------------------")
+	fmt.Println("---------------------------------------------------------------")
 }
