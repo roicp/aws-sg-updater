@@ -129,7 +129,6 @@ func findSecurityGroupID(ctx context.Context, client *ec2.Client, sgID string, s
 
 func syncSecurityGroupRule(ctx context.Context, client *ec2.Client, sgID, publicIP, description string) error {
 	targetCidrIP := publicIP + "/32"
-	ruleNeedsUpdate := false
 	ruleNeedsAdding := true
 	var ruleToRevoke *types.IpPermission = nil
 
@@ -159,23 +158,17 @@ func syncSecurityGroupRule(ctx context.Context, client *ec2.Client, sgID, public
 	for _, ipPerm := range theGroup.IpPermissions {
 		if aws.ToString(ipPerm.IpProtocol) == "tcp" && aws.ToInt32(ipPerm.FromPort) == 0 && aws.ToInt32(ipPerm.ToPort) == 65535 {
 			var rangesToRevoke []types.IpRange
-			var rangesToKeep []types.IpRange
 
 			for _, ipRange := range ipPerm.IpRanges {
 				if aws.ToString(ipRange.Description) == description {
 					if aws.ToString(ipRange.CidrIp) == targetCidrIP {
 						log.Printf("Found existing rule for description '%s' with correct IP %s. No changes needed.\n", description, targetCidrIP)
 						ruleNeedsAdding = false
-						ruleNeedsUpdate = false
-						rangesToKeep = append(rangesToKeep, ipRange)
 						break
 					} else {
 						log.Printf("Found existing rule for description '%s' with outdated IP %s. Marking for removal.\n", description, aws.ToString(ipRange.CidrIp))
-						ruleNeedsUpdate = true
 						rangesToRevoke = append(rangesToRevoke, ipRange)
 					}
-				} else {
-					rangesToKeep = append(rangesToKeep, ipRange)
 				}
 			}
 
@@ -193,7 +186,6 @@ func syncSecurityGroupRule(ctx context.Context, client *ec2.Client, sgID, public
 			if !ruleNeedsAdding {
 				break
 			}
-
 		}
 	}
 
@@ -218,7 +210,7 @@ func syncSecurityGroupRule(ctx context.Context, client *ec2.Client, sgID, public
 		}
 	}
 
-	if ruleNeedsAdding && ruleNeedsUpdate {
+	if ruleNeedsAdding {
 		log.Printf("Authorizing new rule for description '%s' with IP %s...\n", description, targetCidrIP)
 
 		authInput := &ec2.AuthorizeSecurityGroupIngressInput{
@@ -237,42 +229,12 @@ func syncSecurityGroupRule(ctx context.Context, client *ec2.Client, sgID, public
 				},
 			},
 		}
+
 		_, err := client.AuthorizeSecurityGroupIngress(ctx, authInput)
 		if err != nil {
 			var apiErr *smithy.GenericAPIError
 			if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidPermission.Duplicate" {
 				log.Printf("Rule for %s already exists (possibly added concurrently or revoke failed silently). No changes needed.\n", targetCidrIP)
-			} else {
-				return fmt.Errorf("failed to authorize new security group rule for '%s': %w", description, err)
-			}
-		} else {
-			log.Printf("Successfully authorized new rule for description '%s' with IP %s.\n", description, targetCidrIP)
-		}
-	} else if ruleNeedsAdding && !ruleNeedsUpdate {
-		log.Printf("No rule found for description '%s'. Authorizing new rule with IP %s...\n", description, targetCidrIP)
-
-		authInput := &ec2.AuthorizeSecurityGroupIngressInput{
-			GroupId: aws.String(sgID),
-			IpPermissions: []types.IpPermission{
-				{
-					IpProtocol: aws.String("tcp"),
-					FromPort:   aws.Int32(0),
-					ToPort:     aws.Int32(65535),
-					IpRanges: []types.IpRange{
-						{
-							CidrIp:      aws.String(targetCidrIP),
-							Description: aws.String(description),
-						},
-					},
-				},
-			},
-		}
-
-		_, err := client.AuthorizeSecurityGroupIngress(ctx, authInput)
-		if err != nil {
-			var apiErr *smithy.GenericAPIError
-			if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidPermission.Duplicate" {
-				log.Printf("Rule for %s already exists (possibly added concurrently). No changes needed.\n", targetCidrIP)
 			} else {
 				return fmt.Errorf("failed to authorize new security group rule for '%s': %w", description, err)
 			}
