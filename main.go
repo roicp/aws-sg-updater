@@ -127,6 +127,125 @@ func findSecurityGroupID(ctx context.Context, client *ec2.Client, sgID string, s
 	return "", fmt.Errorf("you must specify either --sg-id or --sg-tag-name")
 }
 
+func syncSecurityGroupRule(ctx context.Context, client *ec2.Client, sgID, publicIP, description string) error {
+	targetCidrIP := publicIP + "/32"
+	ruleNeedsAdding := true
+	var ruleToRevoke *types.IpPermission = nil
+
+	log.Printf("Checking existing rules in SG %s for description '%s'\n", sgID, description)
+
+	descInput := &ec2.DescribeSecurityGroupsInput{
+		GroupIds: []string{sgID},
+	}
+
+	sgDesc, err := client.DescribeSecurityGroups(ctx, descInput)
+	if err != nil {
+		var apiErr *smithy.GenericAPIError
+
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidGroup.NotFound" {
+			return fmt.Errorf("security group %s not found during rule sync", sgID)
+		}
+
+		return fmt.Errorf("failed to describe security group %s: %w", sgID, err)
+	}
+
+	if len(sgDesc.SecurityGroups) == 0 {
+		return fmt.Errorf("security group %s description returned empty list", sgID)
+	}
+
+	theGroup := sgDesc.SecurityGroups[0]
+
+	for _, ipPerm := range theGroup.IpPermissions {
+		if aws.ToString(ipPerm.IpProtocol) == "tcp" && aws.ToInt32(ipPerm.FromPort) == 0 && aws.ToInt32(ipPerm.ToPort) == 65535 {
+			var rangesToRevoke []types.IpRange
+
+			for _, ipRange := range ipPerm.IpRanges {
+				if aws.ToString(ipRange.Description) == description {
+					if aws.ToString(ipRange.CidrIp) == targetCidrIP {
+						log.Printf("Found existing rule for description '%s' with correct IP %s. No changes needed.\n", description, targetCidrIP)
+						ruleNeedsAdding = false
+						break
+					} else {
+						log.Printf("Found existing rule for description '%s' with outdated IP %s. Marking for removal.\n", description, aws.ToString(ipRange.CidrIp))
+						rangesToRevoke = append(rangesToRevoke, ipRange)
+					}
+				}
+			}
+
+			if len(rangesToRevoke) > 0 {
+				ruleToRevoke = &types.IpPermission{
+					IpProtocol: ipPerm.IpProtocol,
+					FromPort:   ipPerm.FromPort,
+					ToPort:     ipPerm.ToPort,
+					IpRanges:   rangesToRevoke,
+				}
+
+				break
+			}
+
+			if !ruleNeedsAdding {
+				break
+			}
+		}
+	}
+
+	if ruleToRevoke != nil {
+		log.Printf("Revoking outdated rule(s) for description '%s'...\n", description)
+
+		revokeInput := &ec2.RevokeSecurityGroupIngressInput{
+			GroupId:       aws.String(sgID),
+			IpPermissions: []types.IpPermission{*ruleToRevoke},
+		}
+
+		_, err := client.RevokeSecurityGroupIngress(ctx, revokeInput)
+		if err != nil {
+			var apiErr *smithy.GenericAPIError
+			if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidPermission.NotFound" {
+				log.Printf("Warning: Rule to revoke was not found (maybe already deleted): %v\n", err)
+			} else {
+				return fmt.Errorf("failed to revoke old security group rule for '%s': %w", description, err)
+			}
+		} else {
+			log.Printf("Successfully revoked outdated rule(s) for description '%s'.\n", description)
+		}
+	}
+
+	if ruleNeedsAdding {
+		log.Printf("Authorizing new rule for description '%s' with IP %s...\n", description, targetCidrIP)
+
+		authInput := &ec2.AuthorizeSecurityGroupIngressInput{
+			GroupId: aws.String(sgID),
+			IpPermissions: []types.IpPermission{
+				{
+					IpProtocol: aws.String("tcp"),
+					FromPort:   aws.Int32(0),
+					ToPort:     aws.Int32(65535),
+					IpRanges: []types.IpRange{
+						{
+							CidrIp:      aws.String(targetCidrIP),
+							Description: aws.String(description),
+						},
+					},
+				},
+			},
+		}
+
+		_, err := client.AuthorizeSecurityGroupIngress(ctx, authInput)
+		if err != nil {
+			var apiErr *smithy.GenericAPIError
+			if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidPermission.Duplicate" {
+				log.Printf("Rule for %s already exists (possibly added concurrently or revoke failed silently). No changes needed.\n", targetCidrIP)
+			} else {
+				return fmt.Errorf("failed to authorize new security group rule for '%s': %w", description, err)
+			}
+		} else {
+			log.Printf("Successfully authorized new rule for description '%s' with IP %s.\n", description, targetCidrIP)
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	myName := flag.String("my-name", "", "Name of the host to resolve")
 	profileName := flag.String("profile", "default", "AWS profile name from credentials")
@@ -166,6 +285,11 @@ func main() {
 	finalSgID, err := findSecurityGroupID(ctx, ec2Client, targetSgId, targetSgTagName)
 	if err != nil {
 		log.Fatalf("Error finding Security Group: %v", err)
+	}
+
+	err = syncSecurityGroupRule(ctx, ec2Client, finalSgID, publicIP, *myName)
+	if err != nil {
+		log.Fatalf("Error updating security group rule: %v", err)
 	}
 
 	fmt.Println("---------------------------------------------------------------")
