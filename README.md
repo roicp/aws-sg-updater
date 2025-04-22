@@ -2,7 +2,10 @@
 Updates an AWS Security Group Inbound Role with your public IP address
 
 # Requirements
-Configured AWS CLI
+[AWS CLI get started](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
+
+[AWS CLI setup](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-quickstart.html)
+
 
 # Using multiple IDs
 go run main.go --my-name="Rule description" --profile="AWS config profile" --sg-id="sg-1111111, sg-222222"
