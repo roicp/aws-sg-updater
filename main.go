@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -66,65 +67,98 @@ func loadAWSConfig(ctx context.Context, profileName string) (aws.Config, error) 
 	return cfg, nil
 }
 
-func findSecurityGroupID(ctx context.Context, client *ec2.Client, sgID string, sgTagName string) (string, error) {
-	if sgID != "" {
-		log.Printf("Verifying provided Security Group ID: %s\n", sgID)
+func findSecurityGroupIDs(ctx context.Context, client *ec2.Client, sgIDs []string, sgTagNames []string) ([]string, error) {
+	resolvedIDs := make(map[string]struct{})
+	var errorList []string
 
-		input := &ec2.DescribeSecurityGroupsInput{
-			GroupIds: []string{sgID},
-		}
+	if len(sgIDs) > 0 {
+		log.Printf("Attempting to verify %d provided Security Group ID(s)...\n", len(sgIDs))
 
-		_, err := client.DescribeSecurityGroups(ctx, input)
+		var wg sync.WaitGroup
+		var mu sync.Mutex
 
-		if err != nil {
-			var apiErr *smithy.GenericAPIError
-
-			if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidGroup.NotFound" {
-				return "", fmt.Errorf("security group with ID '%s' not found", sgID)
+		for _, id := range sgIDs {
+			if id == "" {
+				continue
 			}
 
-			return "", fmt.Errorf("failed to verify security group ID '%s': %w", sgID, err)
+			wg.Add(1)
+
+			go func(sgID string) {
+				defer wg.Done()
+
+				input := &ec2.DescribeSecurityGroupsInput{
+					GroupIds: []string{sgID},
+				}
+
+				_, err := client.DescribeSecurityGroups(ctx, input)
+
+				mu.Lock()
+
+				defer mu.Unlock()
+
+				if err != nil {
+					var apiErr *smithy.GenericAPIError
+					if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidGroup.NotFound" {
+						errorList = append(errorList, fmt.Sprintf("ID '%s' not found", sgID))
+					} else {
+						errorList = append(errorList, fmt.Sprintf("failed to verify ID '%s': %v", sgID, err))
+					}
+				} else {
+					resolvedIDs[sgID] = struct{}{}
+				}
+			}(id)
 		}
 
-		log.Printf("Security Group ID %s verified successfully.\n", sgID)
+		wg.Wait()
 
-		return sgID, nil
+		if len(errorList) > 0 {
+			return nil, fmt.Errorf("encountered errors validating SG IDs: %s", strings.Join(errorList, "; "))
+		}
+
+		log.Printf("Successfully verified %d unique Security Group ID(s).\n", len(resolvedIDs))
 	}
 
-	if sgTagName != "" {
-		log.Printf("Searching for Security Group with tag Name: %s\n", sgTagName)
+	if len(sgTagNames) > 0 {
+		log.Printf("Searching for Security Groups with tag Name(s): %v\n", sgTagNames)
 
 		input := &ec2.DescribeSecurityGroupsInput{
 			Filters: []types.Filter{
 				{
 					Name:   aws.String("tag:Name"),
-					Values: []string{sgTagName},
+					Values: sgTagNames,
 				},
 			},
 		}
 
 		result, err := client.DescribeSecurityGroups(ctx, input)
-
 		if err != nil {
-			return "", fmt.Errorf("failed to describe security groups with tag Name '%s': %w", sgTagName, err)
+			return nil, fmt.Errorf("failed to describe security groups with tags '%v': %w", sgTagNames, err)
 		}
 
 		if len(result.SecurityGroups) == 0 {
-			return "", fmt.Errorf("no security group found with tag Name: %s", sgTagName)
+			log.Printf("Warning: No security groups found matching tag Name(s): %v\n", sgTagNames)
+			return nil, nil
+		} else {
+			for _, sg := range result.SecurityGroups {
+				resolvedIDs[*sg.GroupId] = struct{}{}
+			}
+
+			log.Printf("Found %d unique Security Group ID(s) matching tags.\n", len(resolvedIDs))
 		}
-
-		if len(result.SecurityGroups) > 1 {
-			return "", fmt.Errorf("multiple security groups found with tag Name: %s. Please use --sg-id for specificity", sgTagName)
-		}
-
-		foundID := *result.SecurityGroups[0].GroupId
-
-		log.Printf("Found Security Group ID by tag: %s\n", foundID)
-
-		return foundID, nil
 	}
 
-	return "", fmt.Errorf("you must specify either --sg-id or --sg-tag-name")
+	finalIDs := make([]string, 0, len(resolvedIDs))
+
+	for id := range resolvedIDs {
+		finalIDs = append(finalIDs, id)
+	}
+
+	if len(finalIDs) == 0 && len(errorList) == 0 {
+		log.Println("Warning: No valid or matching Security Group IDs were resolved.")
+	}
+
+	return finalIDs, nil
 }
 
 func syncSecurityGroupRule(ctx context.Context, client *ec2.Client, sgID, publicIP, description string) error {
@@ -132,7 +166,7 @@ func syncSecurityGroupRule(ctx context.Context, client *ec2.Client, sgID, public
 	ruleNeedsAdding := true
 	var ruleToRevoke *types.IpPermission = nil
 
-	log.Printf("Checking existing rules in SG %s for description '%s'\n", sgID, description)
+	log.Printf("[%s] Checking existing rules for description '%s'\n", sgID, description)
 
 	descInput := &ec2.DescribeSecurityGroupsInput{
 		GroupIds: []string{sgID},
@@ -143,14 +177,14 @@ func syncSecurityGroupRule(ctx context.Context, client *ec2.Client, sgID, public
 		var apiErr *smithy.GenericAPIError
 
 		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidGroup.NotFound" {
-			return fmt.Errorf("security group %s not found during rule sync", sgID)
+			return fmt.Errorf("[%s] Security group not found during rule sync", sgID)
 		}
 
-		return fmt.Errorf("failed to describe security group %s: %w", sgID, err)
+		return fmt.Errorf("[%s] Failed to describe security group: %w", sgID, err)
 	}
 
 	if len(sgDesc.SecurityGroups) == 0 {
-		return fmt.Errorf("security group %s description returned empty list", sgID)
+		return fmt.Errorf("[%s] Security group description returned empty list", sgID)
 	}
 
 	theGroup := sgDesc.SecurityGroups[0]
@@ -162,11 +196,11 @@ func syncSecurityGroupRule(ctx context.Context, client *ec2.Client, sgID, public
 			for _, ipRange := range ipPerm.IpRanges {
 				if aws.ToString(ipRange.Description) == description {
 					if aws.ToString(ipRange.CidrIp) == targetCidrIP {
-						log.Printf("Found existing rule for description '%s' with correct IP %s. No changes needed.\n", description, targetCidrIP)
+						log.Printf("[%s] Found existing rule for description '%s' with correct IP %s. No changes needed.\n", sgID, description, targetCidrIP)
 						ruleNeedsAdding = false
 						break
 					} else {
-						log.Printf("Found existing rule for description '%s' with outdated IP %s. Marking for removal.\n", description, aws.ToString(ipRange.CidrIp))
+						log.Printf("[%s] Found existing rule for description '%s' with outdated IP %s. Marking for removal.\n", sgID, description, aws.ToString(ipRange.CidrIp))
 						rangesToRevoke = append(rangesToRevoke, ipRange)
 					}
 				}
@@ -190,7 +224,7 @@ func syncSecurityGroupRule(ctx context.Context, client *ec2.Client, sgID, public
 	}
 
 	if ruleToRevoke != nil {
-		log.Printf("Revoking outdated rule(s) for description '%s'...\n", description)
+		log.Printf("[%s] Revoking outdated rule(s) for description '%s'...\n", sgID, description)
 
 		revokeInput := &ec2.RevokeSecurityGroupIngressInput{
 			GroupId:       aws.String(sgID),
@@ -201,17 +235,17 @@ func syncSecurityGroupRule(ctx context.Context, client *ec2.Client, sgID, public
 		if err != nil {
 			var apiErr *smithy.GenericAPIError
 			if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidPermission.NotFound" {
-				log.Printf("Warning: Rule to revoke was not found (maybe already deleted): %v\n", err)
+				log.Printf("[%s] Warning: Rule to revoke was not found (maybe already deleted): %v\n", sgID, err)
 			} else {
-				return fmt.Errorf("failed to revoke old security group rule for '%s': %w", description, err)
+				return fmt.Errorf("[%s] Failed to revoke old security group rule for '%s': %w", sgID, description, err)
 			}
 		} else {
-			log.Printf("Successfully revoked outdated rule(s) for description '%s'.\n", description)
+			log.Printf("[%s] Successfully revoked outdated rule(s) for description '%s'.\n", sgID, description)
 		}
 	}
 
 	if ruleNeedsAdding {
-		log.Printf("Authorizing new rule for description '%s' with IP %s...\n", description, targetCidrIP)
+		log.Printf("[%s] Authorizing rule for description '%s' with IP %s...\n", sgID, description, targetCidrIP)
 
 		authInput := &ec2.AuthorizeSecurityGroupIngressInput{
 			GroupId: aws.String(sgID),
@@ -234,12 +268,12 @@ func syncSecurityGroupRule(ctx context.Context, client *ec2.Client, sgID, public
 		if err != nil {
 			var apiErr *smithy.GenericAPIError
 			if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidPermission.Duplicate" {
-				log.Printf("Rule for %s already exists (possibly added concurrently or revoke failed silently). No changes needed.\n", targetCidrIP)
+				log.Printf("[%s] Rule for %s already exists (possibly added concurrently or revoke failed silently). No changes needed.\n", sgID, targetCidrIP)
 			} else {
-				return fmt.Errorf("failed to authorize new security group rule for '%s': %w", description, err)
+				return fmt.Errorf("[%s] Failed to authorize security group rule for '%s': %w", sgID, description, err)
 			}
 		} else {
-			log.Printf("Successfully authorized new rule for description '%s' with IP %s.\n", description, targetCidrIP)
+			log.Printf("[%s] Successfully authorized rule for description '%s' with IP %s.\n", sgID, description, targetCidrIP)
 		}
 	}
 
@@ -249,8 +283,8 @@ func syncSecurityGroupRule(ctx context.Context, client *ec2.Client, sgID, public
 func main() {
 	myName := flag.String("my-name", "", "Name of the host to resolve")
 	profileName := flag.String("profile", "default", "AWS profile name from credentials")
-	sgId := flag.String("sg-id", "", "Target Security Group ID")
-	sgTagName := flag.String("sg-tag-name", "", "Target Security Group Tag 'Name' (used if --sg-id is not provided)")
+	sgIDsRaw := flag.String("sg-id", "", "Comma-separated list of target Security Group IDs")
+	sgTagNamesRaw := flag.String("sg-tag-name", "", "Comma-separated list of target Security Group Tag 'Name' values")
 
 	flag.Parse()
 
@@ -260,13 +294,61 @@ func main() {
 		os.Exit(1)
 	}
 
-	targetSgId := *sgId
-	targetSgTagName := *sgTagName
-
-	if targetSgId == "" && targetSgTagName == "" {
-		fmt.Println("Neither --sg-id nor --sg-tag-name provided")
+	if *sgIDsRaw == "" && *sgTagNamesRaw == "" {
+		log.Println("Error: You must provide at least one Security Group identifier via --sg-id or --sg-tag-name.")
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	if *sgIDsRaw != "" && *sgTagNamesRaw != "" {
+		log.Println("Error: Please use either --sg-id OR --sg-tag-name, not both.")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	var sgIDs []string
+	var sgTagNames []string
+
+	if *sgIDsRaw != "" {
+		sgIDs = strings.Split(*sgIDsRaw, ",")
+
+		for i := range sgIDs {
+			sgIDs[i] = strings.TrimSpace(sgIDs[i])
+		}
+
+		cleanedIDs := []string{}
+
+		for _, id := range sgIDs {
+			if id != "" {
+				cleanedIDs = append(cleanedIDs, id)
+			}
+		}
+
+		sgIDs = cleanedIDs
+
+		if len(sgIDs) == 0 {
+			log.Fatal("Error: --sg-id flag provided but contained no valid IDs after parsing.")
+		}
+	} else {
+		sgTagNames = strings.Split(*sgTagNamesRaw, ",")
+
+		for i := range sgTagNames {
+			sgTagNames[i] = strings.TrimSpace(sgTagNames[i])
+		}
+
+		cleanedTags := []string{}
+
+		for _, tag := range sgTagNames {
+			if tag != "" {
+				cleanedTags = append(cleanedTags, tag)
+			}
+		}
+
+		sgTagNames = cleanedTags
+
+		if len(sgTagNames) == 0 {
+			log.Fatal("Error: --sg-tag-name flag provided but contained no valid tag names after parsing.")
+		}
 	}
 
 	publicIP, err := getPublicIP()
@@ -282,21 +364,76 @@ func main() {
 
 	ec2Client := ec2.NewFromConfig(awsCfg)
 
-	finalSgID, err := findSecurityGroupID(ctx, ec2Client, targetSgId, targetSgTagName)
+	log.Println("Resolving and validating target Security Group(s)...")
+
+	finalSgIDs, err := findSecurityGroupIDs(ctx, ec2Client, sgIDs, sgTagNames)
 	if err != nil {
-		log.Fatalf("Error finding Security Group: %v", err)
+		log.Fatalf("Error resolving Security Group identifiers: %v", err)
 	}
 
-	err = syncSecurityGroupRule(ctx, ec2Client, finalSgID, publicIP, *myName)
-	if err != nil {
-		log.Fatalf("Error updating security group rule: %v", err)
+	if len(finalSgIDs) == 0 {
+		log.Fatalf("No valid Security Groups found or resolved. Exiting.")
 	}
 
-	fmt.Println("---------------------------------------------------------------")
-	fmt.Printf("✅ Successfully updated Security Group %s\n", finalSgID)
-	fmt.Printf("   Allowed TCP traffic from: %s/32\n", publicIP)
-	fmt.Printf("   Rule description: %s\n", *myName)
-	fmt.Printf("   Using AWS Profile: %s\n", *profileName)
-	fmt.Printf("   Using AWS Region: %s\n", awsCfg.Region)
-	fmt.Println("---------------------------------------------------------------")
+	log.Printf("Resolved %d unique Security Group ID(s) to process: %v", len(finalSgIDs), finalSgIDs)
+
+	log.Printf("Starting rule sync process for %d Security Group(s)...", len(finalSgIDs))
+
+	var wg sync.WaitGroup
+	errorChannel := make(chan error, len(finalSgIDs))
+	successCount := 0
+	var successMu sync.Mutex
+
+	for _, sgID := range finalSgIDs {
+		wg.Add(1)
+
+		go func(currentSgID string) {
+			defer wg.Done()
+
+			log.Printf("[%s] Starting sync...", currentSgID)
+
+			err := syncSecurityGroupRule(ctx, ec2Client, currentSgID, publicIP, *myName)
+			if err != nil {
+				log.Printf("[%s] Error syncing rule: %v", currentSgID, err)
+				errorChannel <- fmt.Errorf("[%s] %w", currentSgID, err)
+			} else {
+				log.Printf("[%s] Sync completed successfully.", currentSgID)
+				successMu.Lock()
+				successCount++
+				successMu.Unlock()
+			}
+		}(sgID)
+	}
+
+	wg.Wait()
+
+	close(errorChannel)
+
+	var syncErrors []error
+
+	for err := range errorChannel {
+		syncErrors = append(syncErrors, err)
+	}
+
+	fmt.Println("-----------------------------------------------------------------------------------")
+	fmt.Println("Sync Process Summary:")
+	fmt.Printf("  Allowed TCP traffic from: %s/32\n", publicIP)
+	fmt.Printf("  Rule description: %s\n", *myName)
+	fmt.Printf("  Using AWS Profile: %s\n", *profileName)
+	fmt.Printf("  Using AWS Region: %s\n", awsCfg.Region)
+	fmt.Printf("  Total Security Groups Processed: %d\n", len(finalSgIDs))
+	fmt.Printf("  Successfully Synced: %d\n", successCount)
+	fmt.Printf("  Failed: %d\n", len(syncErrors))
+
+	if len(syncErrors) > 0 {
+		fmt.Println("  Errors Encountered:")
+		for _, syncErr := range syncErrors {
+			fmt.Printf("    - %v\n", syncErr)
+		}
+		fmt.Println("-----------------------------------------------------------------------------------")
+		os.Exit(1)
+	} else {
+		fmt.Println("-----------------------------------------------------------------------------------")
+		fmt.Println("✅ All specified Security Groups synced successfully.")
+	}
 }
