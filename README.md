@@ -5,7 +5,7 @@ Updates an AWS Security Group Inbound Role with your public IP address
 Configured AWS CLI
 
 # Using multiple IDs
-go run main.go --my-name="Rodrigo" --profile="ipaves" --sg-id="sg-01cde4f76755f5c05, sg-07f7956b1effd9336"
+go run main.go --my-name="Rule description" --profile="AWS config profile" --sg-id="sg-1111111, sg-222222"
 
 # Using multiple Tag Names
-go run main.go --my-name="Rodrigo" --profile="xrm" --sg-tag-name="controlxrm-suporte-sg"
+go run main.go --my-name="Rule description" --profile="AWS config profile" --sg-tag-name="sg-name-a, sg-name-b"
